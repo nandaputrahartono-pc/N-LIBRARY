@@ -314,7 +314,11 @@ async def play_next_song(voice_client, guild_id, channel):
             "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5", "options": "-vn -c:a libopus -b:a 96k",
         }
 
-        source = discord.FFmpegOpusAudio(audio_url, **ffmpeg_option, executable="bin\\ffmpeg\\ffmpeg.exe")
+        source = discord.FFmpegOpusAudio(
+             audio_url,
+             **ffmpeg_option,
+             executable="/usr/bin/ffmpeg"
+        )
             
         def after_play(error):
             if error:
