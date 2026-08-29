@@ -316,8 +316,7 @@ async def play_next_song(voice_client, guild_id, channel):
 
         source = discord.FFmpegOpusAudio(
              audio_url,
-             **ffmpeg_option,
-             executable="./ffmpeg"
+             **ffmpeg_option
         )
             
         def after_play(error):
