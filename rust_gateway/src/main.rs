@@ -73,6 +73,13 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
 #[derive(Serialize)]
+struct ServerMember {
+    name: String,
+    id: String,
+    status: String,
+}
+
+#[derive(Serialize)]
 struct ServerState {
     guild_id: String,
     server_name: String,
@@ -81,11 +88,13 @@ struct ServerState {
     voice_channels: Vec<String>,
     activities: HashMap<String, String>,
     recent_history: Vec<String>,
+    members: Vec<ServerMember>,
 }
 
 #[derive(Serialize)]
 struct ChatRequest {
     message: String,
+    user_id: String,
     user_name: String,
     channel_name: String,
     server_state: Option<ServerState>,
@@ -240,6 +249,7 @@ async fn event_handler(
             let mut activities = HashMap::new();
             
             let mut presence_data = Vec::new();
+            let mut members_data = Vec::new();
             if let Some(guild) = ctx.cache.guild(guild_id) {
                 server_name = guild.name.clone();
 
@@ -291,6 +301,25 @@ async fn event_handler(
                         presence_data.push((*user_id, user_activities.join(" | ")));
                     }
                 }
+
+                for (user_id, member) in guild.members.iter() {
+                    let name = member.user.global_name.clone().unwrap_or(member.user.name.clone());
+                    let status = if let Some(presence) = guild.presences.get(user_id) {
+                        match presence.status {
+                            serenity::model::user::OnlineStatus::Online => "Online",
+                            serenity::model::user::OnlineStatus::Idle => "Idle",
+                            serenity::model::user::OnlineStatus::DoNotDisturb => "Do Not Disturb",
+                            _ => "Offline",
+                        }
+                    } else {
+                        "Offline"
+                    };
+                    members_data.push(ServerMember {
+                        name,
+                        id: user_id.get().to_string(),
+                        status: status.to_string(),
+                    });
+                }
             } // end of guild cache lock
 
             // Resolve nama user untuk Activities
@@ -340,11 +369,13 @@ async fn event_handler(
                 voice_channels: formatted_voice_channels,
                 activities,
                 recent_history,
+                members: members_data,
             });
         }
 
         let request_body = ChatRequest {
             message: clean_message,
+            user_id: msg.author.id.get().to_string(),
             user_name,
             channel_name,
             server_state,
