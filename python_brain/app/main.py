@@ -3,7 +3,10 @@ import json
 import time
 import requests
 from collections import defaultdict
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import FileResponse
+import tempfile
+import edge_tts
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
 from groq import Groq
@@ -179,10 +182,11 @@ def build_system_prompt(request: ChatRequest) -> str:
             
         prompt += (
             "\n--- ATURAN TOOL (internal, jangan disebutkan ke user kecuali relevan) ---\n"
-            "- Kamu punya fungsi `manage_role` untuk tambah/hapus role.\n"
-            "- HANYA jalankan kalau Admin yang minta. Kalau bukan Admin, tolak santai.\n"
-            "- Kalau ganti role, jalankan 2x: hapus lama, tambah baru.\n"
-            "- JANGAN pernah menawarkan fitur ini duluan. Tunggu user yang minta.\n"
+            "- Kamu punya fungsi `manage_role` untuk tambah/hapus role (hanya Admin).\n"
+            "- Kamu punya fungsi `manage_voice` untuk masuk (join) atau keluar (leave) Voice Channel.\n"
+            "- JANGAN pernah menawarkan fitur manage_role duluan. Tunggu user yang minta.\n"
+            "- Kalau disuruh 'masuk voice', panggil `manage_voice` dengan action 'join'.\n"
+            "- Kalau disuruh 'keluar voice', panggil `manage_voice` dengan action 'leave'.\n"
         )
         
     return prompt
@@ -218,6 +222,24 @@ tools = [
                 "required": ["action", "user_name", "role_name"],
             },
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_voice",
+            "description": "Menyuruh bot untuk masuk (join) atau keluar (leave) dari Voice Channel user.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["join", "leave"],
+                        "description": "Tindakan: 'join' untuk menyuruh bot masuk ke VC user, 'leave' untuk keluar.",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
     }
 ]
 
@@ -245,6 +267,32 @@ def execute_manage_role(guild_id: str, action: str, user_name: str, role_name: s
             return f"Gagal memanggil API: HTTP {response.status_code}"
     except Exception as e:
         return f"Error menghubungi server Rust: {e}"
+
+def execute_manage_voice(guild_id: str, user_id: str, action: str) -> str:
+    """Eksekusi memanggil internal API Rust untuk join/leave voice."""
+    try:
+        response = requests.post(
+            "http://localhost:8080/api/voice_control",
+            json={
+                "guild_id": guild_id,
+                "user_id": user_id,
+                "action": action
+            },
+            timeout=5
+        )
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success"):
+                if action == "join":
+                    return "Berhasil masuk ke Voice Channel! Silakan sapa user di VC."
+                else:
+                    return "Berhasil keluar dari Voice Channel."
+            else:
+                return f"Gagal {action} Voice Channel: {result.get('error')}"
+        else:
+            return f"Gagal memanggil API Voice: HTTP {response.status_code}"
+    except Exception as e:
+        return f"Error menghubungi server Rust untuk Voice: {e}"
 
 
 # ============================================================
@@ -321,6 +369,15 @@ async def chat(request: ChatRequest):
                             user_name=function_args.get("user_name"),
                             role_name=function_args.get("role_name")
                         )
+                elif function_name == "manage_voice":
+                    if not request.server_state:
+                        tool_result = "Gagal: Tidak ada context server."
+                    else:
+                        tool_result = execute_manage_voice(
+                            guild_id=request.server_state.guild_id,
+                            user_id=request.user_id,
+                            action=function_args.get("action")
+                        )
                 
                 # Masukkan hasil tool execution ke riwayat pesan
                 messages.append({
@@ -356,7 +413,109 @@ async def chat(request: ChatRequest):
             detail=f"Gagal memproses AI: {str(e)}",
         )
 
+@app.post("/api/voice_chat")
+async def voice_chat(
+    file: UploadFile = File(...),
+    user_id: str = Form(...),
+    user_name: str = Form(...),
+    channel_name: str = Form(...),
+    participant_count: int = Form(...),
+    server_state_json: str = Form(None)
+):
+    """
+    Menerima rekaman suara dari Rust, mengubah ke teks (STT),
+    memproses jawaban LLM, dan mengembalikan file MP3 (TTS).
+    """
+    if not groq_client:
+        raise HTTPException(status_code=503, detail="Groq API Key missing")
 
+    # 1. Simpan audio sementara
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+        content = await file.read()
+        tmp_wav.write(content)
+        wav_path = tmp_wav.name
+
+    try:
+        # 2. STT via Groq Whisper
+        with open(wav_path, "rb") as f:
+            transcript_res = groq_client.audio.transcriptions.create(
+                file=("audio.wav", f),
+                model="whisper-large-v3",
+                prompt="Teks dalam bahasa Indonesia",
+                language="id"
+            )
+        
+        user_text = transcript_res.text.strip()
+        
+        # 3. Filter Halusinasi Silence dari Whisper
+        import re
+        lower_text = user_text.lower()
+        clean_text = re.sub(r'[^\w\s]', '', lower_text).strip()
+        
+        ignore_phrases = [
+            "terima kasih telah menonton", 
+            "terima kasih",
+            "halo",
+            "terima kasih sudah menonton",
+            "terima kasih banyak"
+        ]
+        
+        from fastapi import Response
+        if not clean_text or clean_text in ignore_phrases or len(clean_text) < 2:
+            print(f"[Voice] Ignored (Silence/Hallucination): {user_text}")
+            return Response(status_code=204)
+
+        print(f"[Voice] {user_name} berkata: {user_text}")
+
+        # 4. Dynamic Wake Word
+        if participant_count > 2:
+            wake_words = ["ai", "bot", "n-library", "n library", "gadis"]
+            if not any(word in clean_text for word in wake_words):
+                print(f"[Voice] Ignored (No wake word & rame): {user_text}")
+                return Response(status_code=204)
+
+        # 5. LLM Chat (Rekonstruksi request)
+        server_state = None
+        if server_state_json:
+            try:
+                server_state_dict = json.loads(server_state_json)
+                server_state = ServerState(**server_state_dict)
+            except Exception:
+                pass
+
+        chat_req = ChatRequest(
+            message=user_text,
+            user_id=user_id,
+            user_name=user_name,
+            channel_name=channel_name,
+            server_state=server_state
+        )
+
+        # Process as normal chat (tapi bisa panggil tool)
+        response_model = await chat(chat_req)
+        ai_reply = response_model.reply
+        
+        print(f"[AI Voice Reply] {ai_reply}")
+
+        # 6. TTS via Edge-TTS (Strip emojis first!)
+        import re
+        # Hapus emoji / simbol aneh agar TTS gak bacain kode emot (tapi tetap pertahankan huruf, angka, tanda baca dasar)
+        tts_text = re.sub(r'[^\w\s,.?!;:\'"-]', '', ai_reply)
+        
+        voice = "id-ID-GadisNeural"
+        tts = edge_tts.Communicate(tts_text, voice)
+        
+        mp3_path = wav_path.replace(".wav", ".mp3")
+        await tts.save(mp3_path)
+
+        return FileResponse(mp3_path, media_type="audio/mpeg", filename="reply.mp3")
+
+    except Exception as e:
+        print(f"[ERROR] Voice Pipeline: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 # ============================================================
 # Startup
 # ============================================================

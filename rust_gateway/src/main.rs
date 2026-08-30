@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::collections::HashMap;
+use songbird::SerenityInit;
+
+mod voice;
 
 // ============================================================
 // Python Brain Process Manager
@@ -113,6 +116,7 @@ struct ChatResponse {
 struct AppState {
     http: Arc<serenity::Http>,
     cache: Arc<serenity::Cache>,
+    songbird_manager: Arc<songbird::Songbird>,
 }
 
 #[derive(Deserialize)]
@@ -189,13 +193,170 @@ async fn manage_role_handler(
     }
 }
 
+#[derive(Deserialize)]
+struct VoiceControlRequest {
+    guild_id: String,
+    user_id: String,
+    action: String, // "join" | "leave"
+}
+
+async fn voice_control_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<VoiceControlRequest>,
+) -> Json<ApiResponse> {
+    let guild_id = match payload.guild_id.parse::<u64>() {
+        Ok(id) => serenity::GuildId::new(id),
+        Err(_) => return Json(ApiResponse { success: false, error: Some("Invalid Guild ID".into()) }),
+    };
+
+    if payload.action == "leave" {
+        if state.songbird_manager.get(guild_id).is_some() {
+            let _ = state.songbird_manager.remove(guild_id).await;
+            return Json(ApiResponse { success: true, error: None });
+        }
+        return Json(ApiResponse { success: false, error: Some("Bot is not in a VC".into()) });
+    }
+
+    if payload.action == "join" {
+        let user_id = match payload.user_id.parse::<u64>() {
+            Ok(id) => serenity::UserId::new(id),
+            Err(_) => return Json(ApiResponse { success: false, error: Some("Invalid User ID".into()) }),
+        };
+
+        // Find which channel the user is in
+        let channel_id = {
+            let guild = match state.cache.guild(guild_id) {
+                Some(g) => g,
+                None => return Json(ApiResponse { success: false, error: Some("Guild not found in cache".into()) }),
+            };
+            guild.voice_states.get(&user_id).and_then(|vs| vs.channel_id)
+        };
+
+        match channel_id {
+            Some(channel) => {
+                // Attach events
+                {
+                    let handler_lock = state.songbird_manager.get_or_insert(guild_id);
+                    let mut handler = handler_lock.lock().await;
+
+                    let receiver = voice::Receiver::new(guild_id, state.songbird_manager.clone());
+                    
+                    handler.add_global_event(
+                        songbird::events::CoreEvent::SpeakingStateUpdate.into(),
+                        receiver.clone(),
+                    );
+                    handler.add_global_event(
+                        songbird::events::CoreEvent::VoiceTick.into(),
+                        receiver,
+                    );
+                }
+
+                if let Ok(_handler_lock) = state.songbird_manager.join(guild_id, channel).await {
+                    return Json(ApiResponse { success: true, error: None });
+                } else {
+                    let _ = state.songbird_manager.remove(guild_id).await;
+                    return Json(ApiResponse { success: false, error: Some("Gagal masuk ke Voice Channel".into()) });
+                }
+            }
+            None => {
+                return Json(ApiResponse { success: false, error: Some("User is not in a Voice Channel".into()) });
+            }
+        }
+    }
+
+    Json(ApiResponse { success: false, error: Some("Unknown action".into()) })
+}
+
 // ============================================================
 // Slash Commands
 // ============================================================
 
-#[poise::command(slash_command)]
+#[poise::command(slash_command, prefix_command)]
 async fn ping(ctx: Context<'_>) -> Result<(), Error> {
     ctx.say("Pong! 🏓").await?;
+    Ok(())
+}
+
+#[poise::command(slash_command, prefix_command)]
+async fn join(ctx: Context<'_>) -> Result<(), Error> {
+    let (guild_id, channel_id) = {
+        let guild = ctx.guild().unwrap();
+        let channel_id = guild
+            .voice_states
+            .get(&ctx.author().id)
+            .and_then(|voice_state| voice_state.channel_id);
+        (guild.id, channel_id)
+    };
+
+    let connect_to = match channel_id {
+        Some(channel) => channel,
+        None => {
+            ctx.say("Kamu harus masuk ke Voice Channel dulu ya!").await?;
+            return Ok(());
+        }
+    };
+
+    let manager = songbird::get(ctx.serenity_context())
+        .await
+        .expect("Songbird Voice client placed in at initialisation.").clone();
+
+    // Attach events sebelum join
+    {
+        let handler_lock = manager.get_or_insert(guild_id);
+        let mut handler = handler_lock.lock().await;
+
+        let receiver = voice::Receiver::new(guild_id, manager.clone());
+        
+        handler.add_global_event(
+            songbird::events::CoreEvent::SpeakingStateUpdate.into(),
+            receiver.clone(),
+        );
+        handler.add_global_event(
+            songbird::events::CoreEvent::VoiceTick.into(),
+            receiver,
+        );
+    }
+
+    match manager.join(guild_id, connect_to).await {
+        Ok(_) => {
+            ctx.say("Halo! Aku udah masuk Voice Channel ya 🎙️").await?;
+        }
+        Err(e) => {
+            let _ = manager.remove(guild_id).await;
+            eprintln!("Voice Join Error: {:?}", e);
+            ctx.say(format!("Error: Gagal masuk ke Voice Channel. {:?}", e)).await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[poise::command(slash_command, prefix_command)]
+async fn leave(ctx: Context<'_>) -> Result<(), Error> {
+    let guild_id = ctx.guild_id().unwrap();
+
+    let manager = songbird::get(ctx.serenity_context())
+        .await
+        .expect("Songbird Voice client placed in at initialisation.").clone();
+
+    if manager.get(guild_id).is_some() {
+        if let Err(e) = manager.remove(guild_id).await {
+            ctx.say(format!("Gagal keluar: {:?}", e)).await?;
+        } else {
+            ctx.say("Daah~ Aku keluar Voice Channel ya 👋").await?;
+        }
+    } else {
+        ctx.say("Aku lagi nggak ada di Voice Channel.").await?;
+    }
+
+    Ok(())
+}
+
+#[poise::command(slash_command, prefix_command)]
+async fn gender(ctx: Context<'_>, suara: String) -> Result<(), Error> {
+    // Nantinya command ini akan mengatur state suara ke `Gadis` atau `Ardi`.
+    // Sekarang hanya sebagai placeholder (akan ditangani di Python nanti).
+    ctx.say(format!("Siap! Suaraku akan disetel ke '{}'. (Fitur sedang diimplementasikan)", suara)).await?;
     Ok(())
 }
 
@@ -433,7 +594,11 @@ async fn main() {
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: vec![ping()],
+            commands: vec![ping(), join(), leave(), gender()],
+            prefix_options: poise::PrefixFrameworkOptions {
+                prefix: Some("!".into()),
+                ..Default::default()
+            },
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))
             },
@@ -448,19 +613,28 @@ async fn main() {
         })
         .build();
 
+    let songbird_config = songbird::Config::default()
+        .decode_mode(songbird::driver::DecodeMode::Decode(Default::default()));
+
     let mut client = serenity::ClientBuilder::new(&token, intents)
         .framework(framework)
+        .register_songbird_from_config(songbird_config)
         .await
         .expect("Gagal membuat Discord client");
 
     // 3. Start Axum Server for Internal API
+    // Ambil manager dari client.data
+    let songbird_manager = client.data.read().await.get::<songbird::SongbirdKey>().unwrap().clone();
+
     let axum_state = AppState {
         http: client.http.clone(),
         cache: client.cache.clone(),
+        songbird_manager,
     };
 
     let app = Router::new()
         .route("/api/role", post(manage_role_handler))
+        .route("/api/voice_control", post(voice_control_handler))
         .with_state(axum_state);
 
     tokio::spawn(async move {
